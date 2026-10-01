@@ -14,6 +14,7 @@ A simple and fast GUI for Microsoft LAPS (legacy) and Windows LAPS. With this to
 ## Features
 
 - Simple and fast: Run the PowerShell script or Batch file, type the computer name and press the ENTER key.
+- Computer drop down list with all LAPS managed computers of the forest (loaded on start). Typing filters the list (starts with, otherwise contains).
 - Supports Microsoft LAPS (legacy) and Windows LAPS on Active Directory environments.
 - Query the user name, password and password expiration timestamp of the LAPS account.
 - Query the account history of computer objects in your local Active Directory (Windows LAPS only).
