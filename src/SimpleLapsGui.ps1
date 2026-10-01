@@ -246,6 +246,187 @@ $script:BgJobTimer.Add_Tick({
 
 
 
+#### Computer list (drop down of the search field)
+############################################################################
+# On start a background job reads all LAPS managed computer objects (Windows LAPS or legacy LAPS expiration
+# time attribute is set) from all domains of the current forest. The password attributes are not read here
+# to not create password read audit events for every computer.
+# Computers of the current domain are listed by name and computers of other domains as "domain\name".
+
+$Script:AllLapsComputers = [string[]]@()
+
+$ComputerListSyncHash = [hashtable]::Synchronized(@{
+    State = 'None' # None, Running, Completed
+    Computers = $null
+    ErrorMessage = ''
+})
+
+$compListRunSpace = [runspacefactory]::CreateRunspace([initialsessionstate]::CreateDefault2())
+$compListRunSpace.Open()
+$compListRunSpace.SessionStateProxy.SetVariable('ComputerListSyncHash', $ComputerListSyncHash)
+$compListPsInstance = [powershell]::Create()
+$compListPsInstance.Runspace = $compListRunSpace
+$Script:CompListInvokationHandle = $null
+
+# Background job script for reading the computer list
+[scriptblock]$GetComputerListScript = {
+    $ComputerListSyncHash.State = 'Running'
+    $computers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $errors = [System.Collections.Generic.List[string]]::new()
+
+    try {
+        Add-Type -AssemblyName System.DirectoryServices -ErrorAction SilentlyContinue
+        $currentDomainDn = [string]([adsi]"LDAP://RootDSE").Properties["defaultNamingContext"].Value
+
+        # Domains to search: current domain first, then the other domains of the forest
+        $domains = [System.Collections.Generic.List[object]]::new()
+        $domains.Add([PSCustomObject]@{ DnsName = ""; SearchRoot = "LDAP://$currentDomainDn"; IsCurrent = $true })
+        try {
+            foreach ($d in [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest().Domains) {
+                $dDn = "DC=" + ($d.Name -replace '\.', ',DC=')
+                if ($dDn -ne $currentDomainDn) {
+                    $domains.Add([PSCustomObject]@{ DnsName = $d.Name; SearchRoot = "LDAP://$($d.Name)/$dDn"; IsCurrent = $false })
+                }
+            }
+        }
+        catch { }
+
+        foreach ($domain in $domains) {
+            $searcher = $null
+            $results = $null
+            try {
+                $searcher = [System.DirectoryServices.DirectorySearcher]::new([adsi]$domain.SearchRoot)
+                $searcher.Filter = "(&(objectCategory=computer)(|(msLAPS-PasswordExpirationTime=*)(ms-Mcs-AdmPwdExpirationTime=*)))"
+                $searcher.PageSize = 1000
+                $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+                [void]$searcher.PropertiesToLoad.Add("name")
+                $results = $searcher.FindAll()
+                foreach ($r in $results) {
+                    if ($r.Properties["name"].Count -gt 0) {
+                        $compName = [string]$r.Properties["name"][0]
+                        if ($domain.IsCurrent) { [void]$computers.Add($compName) }
+                        else { [void]$computers.Add("$($domain.DnsName)\$compName") }
+                    }
+                }
+            }
+            catch {
+                $errors.Add("$(if ($domain.IsCurrent) {'Current domain'} else {$domain.DnsName}): $($_.Exception.Message)")
+            }
+            finally {
+                if ($null -ne $results) { $results.Dispose() }
+                if ($null -ne $searcher) { $searcher.Dispose() }
+            }
+        }
+    }
+    catch {
+        $errors.Add($_.Exception.Message)
+    }
+
+    $sorted = [string[]]::new($computers.Count)
+    $computers.CopyTo($sorted)
+    [System.Array]::Sort($sorted, [System.StringComparer]::OrdinalIgnoreCase)
+    $ComputerListSyncHash.Computers = $sorted
+    $ComputerListSyncHash.ErrorMessage = ($errors -join " | ")
+    $ComputerListSyncHash.State = 'Completed'
+}
+
+# WinForms timer to handle the result of the computer list job
+$script:CompListTimer = New-Object System.Windows.Forms.Timer
+$script:CompListTimer.Interval = 200  # milliseconds
+$script:CompListTimer.Add_Tick({
+    if ($ComputerListSyncHash.State -ne 'Completed') { return }
+    $script:CompListTimer.Stop()
+    try { $compListPsInstance.EndInvoke($Script:CompListInvokationHandle) } catch { }
+
+    $Script:AllLapsComputers = [string[]]$ComputerListSyncHash.Computers
+    $ComputerListSyncHash.Computers = $null
+    $ComputerListSyncHash.State = 'None'
+    $CompListRunningGif.Image = $null
+    $CompListRunningGif.Hide()
+    Update-ComputerComboBoxItems
+
+    # Don't overwrite the status of a running or finished password search
+    if ($statusText.Text -eq $Script:CompListLoadingStatusText) {
+        if ([string]::IsNullOrEmpty($ComputerListSyncHash.ErrorMessage)) {
+            Set-StatusText -Text "$($Script:AllLapsComputers.Count) LAPS managed computer(s) loaded." -Color Blue
+        }
+        else {
+            Set-StatusText -Text "$($Script:AllLapsComputers.Count) computer(s) loaded with errors! - Hover for more information." `
+                -AccessibleText "$($Script:AllLapsComputers.Count) computer(s) loaded with errors: $($ComputerListSyncHash.ErrorMessage)" `
+                -ToolTipText $ComputerListSyncHash.ErrorMessage `
+                -Color Red
+        }
+    }
+})
+
+$Script:CompListLoadingStatusText = "Loading list of LAPS managed computers ..."
+
+function Start-ComputerListLoading {
+    $CompListRunningGif.Image = $progressRunningGifImage
+    $CompListRunningGif.Show()
+    Set-StatusText -Text $Script:CompListLoadingStatusText -Color Black
+    $ComputerListSyncHash.State = 'Running'
+    $compListPsInstance.Commands.Clear()
+    [void]$compListPsInstance.AddScript($GetComputerListScript)
+    $Script:CompListInvokationHandle = $compListPsInstance.BeginInvoke()
+    $script:CompListTimer.Start()
+}
+
+# Returns the sorted computers matching the filter text:
+# Computers starting with the filter (or whose name after "domain\" starts with it). If nothing matches, computers containing the filter.
+function Get-FilteredComputerList ([string]$Filter) {
+    $Filter = $Filter.Trim()
+    if ([string]::IsNullOrEmpty($Filter)) {
+        return ,$Script:AllLapsComputers
+    }
+
+    $result = [System.Collections.Generic.List[string]]::new()
+    foreach ($c in $Script:AllLapsComputers) {
+        $namePart = $c.Substring($c.LastIndexOf('\') + 1)
+        if ($c.StartsWith($Filter, [System.StringComparison]::OrdinalIgnoreCase) -or $namePart.StartsWith($Filter, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.Add($c)
+        }
+    }
+    if ($result.Count -eq 0) {
+        foreach ($c in $Script:AllLapsComputers) {
+            if ($c.IndexOf($Filter, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $result.Add($c)
+            }
+        }
+    }
+    return ,$result.ToArray()
+}
+
+# Fills the drop down list of the computer field based on the current text
+# - Parameter [switch]$ShowDropDown : Open the list if there are matching items (used while typing).
+function Update-ComputerComboBoxItems ([switch]$ShowDropDown) {
+    $filterText = $compComboBox.Text
+    $selectionStart = $compComboBox.SelectionStart
+    $filtered = Get-FilteredComputerList -Filter $filterText
+
+    $compComboBox.BeginUpdate()
+    $compComboBox.Items.Clear()
+    if ($filtered.Count -gt 0) {
+        $compComboBox.Items.AddRange([object[]]$filtered)
+    }
+    $compComboBox.EndUpdate()
+
+    if ($filtered.Count -eq 0) {
+        if ($compComboBox.DroppedDown) { $compComboBox.DroppedDown = $false }
+    }
+    elseif ($ShowDropDown -and -not [string]::IsNullOrWhiteSpace($filterText) -and -not $compComboBox.DroppedDown) {
+        $compComboBox.DroppedDown = $true
+        # Opening the list hides the mouse cursor
+        [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+    }
+
+    # Clearing the items and opening the list changes the text and selection. => Restore them.
+    $compComboBox.Text = $filterText
+    $compComboBox.SelectionStart = [Math]::Min($selectionStart, $filterText.Length)
+    $compComboBox.SelectionLength = 0
+}
+
+
 #### Password & Time set methods
 ############################################################################
 # How search/get password and set time works:
@@ -369,7 +550,7 @@ function Invoke-GetPasswordBtnCmd ([switch]$UpdateAfterTimeSet)
     $ThreadSyncHash.DomainComputer_Domain = $null
     $ThreadSyncHash.DomainComputer_HasWinLaps = $false
     #---
-    $compTextBox.Enabled = $false
+    $compComboBox.Enabled = $false
     $GoButton.Enabled = $false
     if ($UpdateAfterTimeSet -eq $false) {
         $SearchRunningGif.Image = $progressRunningGifImage
@@ -399,11 +580,11 @@ function Invoke-GetPasswordBtnCmd ([switch]$UpdateAfterTimeSet)
     Start-Sleep -Milliseconds 250 # To show status correct.
 
     # Check computer name input
-    [string]$inputComputerName = $compTextBox.Text
+    [string]$inputComputerName = $compComboBox.Text
     if ([string]::IsNullOrWhiteSpace($inputComputerName))
     {
         Set-StatusText -Text "Failed: You must enter a computer name!" -Color Red
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $GoButton.Enabled = $true
         $SearchRunningGif.Image = $null
         $SearchRunningGif.Hide()
@@ -412,7 +593,7 @@ function Invoke-GetPasswordBtnCmd ([switch]$UpdateAfterTimeSet)
     }
     if ($inputComputerName -match "^CN=.*,.*DN=.*") {
         Set-StatusText -Text "Failed: Distinguished name (DN) is not supported!" -Color Red
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $GoButton.Enabled = $true
         $SearchRunningGif.Image = $null
         $SearchRunningGif.Hide()
@@ -424,7 +605,7 @@ function Invoke-GetPasswordBtnCmd ([switch]$UpdateAfterTimeSet)
     # -- domain can keep unchanged
     if ($inputComputerName -eq ".\") {
         # .\ (local host)
-        $compTextBox.Text = $env:COMPUTERNAME
+        $compComboBox.Text = $env:COMPUTERNAME
         $ThreadSyncHash.SearchComputerInput_Text = $env:COMPUTERNAME
         $ThreadSyncHash.DomainComputer_Identity = $env:COMPUTERNAME
         $ThreadSyncHash.DomainComputer_Domain = $null
@@ -549,7 +730,7 @@ function Invoke-GetPasswordBtnCmd ([switch]$UpdateAfterTimeSet)
 function Invoke-SetExpirationTimeBtnCmd($pForm)
 {
     # Diasbel main form controls
-    $compTextBox.Enabled = $false
+    $compComboBox.Enabled = $false
     $GoButton.Enabled = $false
     $AccountNameCopyButton.Enabled = $false
     $AccountNamePreviewButton.Enabled = $false
@@ -578,7 +759,7 @@ function Invoke-SetExpirationTimeBtnCmd($pForm)
         <# Test for required commandlet for legacy laps pc
         if (!$ThreadSyncHash.DomainComputer_HasWinLaps -and !$Script:IsLegacyLapsInstalled) {
             # return false; Legacy LAPS module not installed
-            $compTextBox.Enabled = $true
+            $compComboBox.Enabled = $true
             $GoButton.Enabled = $true
             $AccountNameCopyButton.Enabled = $true
             $AccountNamePreviewButton.Enabled = $true
@@ -610,7 +791,7 @@ function Invoke-SetExpirationTimeBtnCmd($pForm)
     else
     {
         # Return $false on "Cancel" button
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $GoButton.Enabled = $true
         $AccountNameCopyButton.Enabled = $true
         $AccountNamePreviewButton.Enabled = $true
@@ -630,7 +811,7 @@ function Invoke-SetExpirationTimeBtnCmd($pForm)
 function Update-WindowAfterBgJob([ValidateSet('SearchPassword', 'SetTime')]$Job, [ValidateSet('Success', 'Aborted', 'Failed')]$JobResult) {
     # Search / get password => failed
     if ( ($Job -eq 'SearchPassword') -and ($JobResult -eq 'Failed') ) {
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $ListPwdHistory.Enabled = $true
         $SearchRunningGif.Image = $null
         $SearchRunningGif.Hide()
@@ -688,7 +869,7 @@ function Update-WindowAfterBgJob([ValidateSet('SearchPassword', 'SetTime')]$Job,
             }
             Update-PasswordHistoryListView -PwdList $ThreadSyncHash.ThreadCommand_Data.PwdHistory
         }
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $ListPwdHistory.Enabled = $true
         $SearchRunningGif.Image = $null
         $SearchRunningGif.Hide()
@@ -699,7 +880,7 @@ function Update-WindowAfterBgJob([ValidateSet('SearchPassword', 'SetTime')]$Job,
     }
     # Time set => failed
     elseif ( ($Job -eq 'SetTime') -and ($JobResult -eq 'Failed') ) {
-        $compTextBox.Enabled = $true
+        $compComboBox.Enabled = $true
         $GoButton.Enabled = $true
         $AccountNameCopyButton.Enabled = $true
         $AccountNamePreviewButton.Enabled = $true
@@ -1428,11 +1609,11 @@ $mainForm.Icon = $windowIconImage
 # ----- Area: Computer name ----------------------
 $CompHeaderLabel = New-Object system.Windows.Forms.Label
 $CompHeaderLabel.Location = New-Object System.Drawing.Point(10,6)
-$CompHeaderLabel.Size = New-Object System.Drawing.Point(150,25)
+$CompHeaderLabel.Size = New-Object System.Drawing.Point(250,25)
 $CompHeaderLabel.Font = $headerFont
 $CompHeaderLabel.ForeColor = "Black"
 $CompHeaderLabel.BackColor = "White"
-$CompHeaderLabel.Text = "Search Computer"
+$CompHeaderLabel.Text = "Select Computer from List"
 $mainForm.Controls.Add($CompHeaderLabel)
 
 $CompHeaderLine = New-Object system.Windows.Forms.Label
@@ -1444,18 +1625,36 @@ $CompHeaderLine.AutoSize = $flase
 $CompHeaderLine.AccessibleRole = 'Separator'
 $mainForm.Controls.Add($CompHeaderLine)
 
-$compTextBox = New-Object System.Windows.Forms.TextBox
-$compTextBox.Location = New-Object System.Drawing.Size(15,37)
-$compTextBox.Size = New-Object System.Drawing.Size(365,50)
-$compTextBox.Font = $textFont
-$compTextBox.AccessibleName = 'Computer name to search'
-$compTextBox.AccessibleRole = 'Text'
-$mainForm.Controls.Add($compTextBox)
+$compComboBox = New-Object System.Windows.Forms.ComboBox
+$compComboBox.Location = New-Object System.Drawing.Size(15,36)
+$compComboBox.Size = New-Object System.Drawing.Size(315,50)
+$compComboBox.Font = $textFont
+$compComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+$compComboBox.Sorted = $false # The list is already sorted.
+$compComboBox.MaxDropDownItems = 15
+$compComboBox.AccessibleName = 'Computer name to search'
+$compComboBox.AccessibleRole = 'ComboBox'
+$compComboBox.Add_TextUpdate({ Update-ComputerComboBoxItems -ShowDropDown })
+$compComboBox.Add_KeyDown({
+    if ($this.DroppedDown -and $_.KeyCode -eq 'Enter') {
+        # Enter in the open list: close the list and search (The form's AcceptButton isn't triggered in this case.)
+        $_.Handled = $true
+        $_.SuppressKeyPress = $true
+        $this.DroppedDown = $false
+        $GoButton.PerformClick()
+    }
+    elseif ($this.DroppedDown -and $_.KeyCode -eq 'Escape') {
+        # Escape in the open list only closes the list and not the window.
+        $Script:CompListEscapePressed = $true
+    }
+})
+$mainForm.Controls.Add($compComboBox)
+$Script:CompListEscapePressed = $false
 
 $GoButton = New-Object System.Windows.Forms.Button
-$GoButton.Location = New-Object System.Drawing.Size(400,35)
-$GoButton.Size = New-Object System.Drawing.Size(75,25)
-$GoButton.Text = "Search"
+$GoButton.Location = New-Object System.Drawing.Size(345,35)
+$GoButton.Size = New-Object System.Drawing.Size(130,25)
+$GoButton.Text = "Decrypt Password"
 $GoButton.Font = $textFont
 $GoButton.Add_Click({ Invoke-GetPasswordBtnCmd; })
 $mainForm.Controls.Add($GoButton)
@@ -1470,13 +1669,22 @@ $SearchRunningGif.Hide()
 $SearchRunningGif.Image = $null
 $mainForm.Controls.Add($SearchRunningGif)
 
+$CompListRunningGif = New-Object System.Windows.Forms.PictureBox
+$CompListRunningGif.Location = New-Object System.Drawing.Size(483,38)
+$CompListRunningGif.Size = New-Object System.Drawing.Size(19,19)
+$CompListRunningGif.SizeMode = 'Zoom'
+$CompListRunningGif.AccessibleName = 'Loading computer list indication'
+$CompListRunningGif.Hide()
+$CompListRunningGif.Image = $null
+$mainForm.Controls.Add($CompListRunningGif)
+
 $CompInfoText = New-Object system.Windows.Forms.Label
 $CompInfoText.Font = $hintFont
 $CompInfoText.ForeColor = "Blue"
 $CompInfoText.BackColor = "White"
 $CompInfoText.Location = New-Object System.Drawing.Point(15,62)
 $CompInfoText.Size = New-Object System.Drawing.Point(365,15)
-$CompInfoText.Text = "Use Domain\Computer or the FQDN to specify a custom domain."
+$CompInfoText.Text = "Select or type to filter. Use Domain\Computer or FQDN for other domains."
 $mainForm.Controls.Add($CompInfoText)
 
 # ----- Area: Current Account ----------------------
@@ -1783,7 +1991,7 @@ $aboutText.Add_Click({$aboutForm.ShowDialog($mainForm)})
 
 #----- Area: Enable/disable ui controls ----------------------
 function Set-MainWindowControlsDisabled {
-    $compTextBox.Enabled = $False
+    $compComboBox.Enabled = $False
     $goButton.Enabled = $False
     $AccountNameCopyButton.Enabled = $false;
     $AccountNamePreviewButton.Enabled = $false
@@ -1794,7 +2002,7 @@ function Set-MainWindowControlsDisabled {
 }
 
 function Set-MainWindowControlsEnabled {
-    $compTextBox.Enabled = $true;
+    $compComboBox.Enabled = $true;
     $GoButton.Enabled = $true;
     $AccountNameCopyButton.Enabled = $true;
     $AccountNamePreviewButton.Enabled = $true
@@ -1844,9 +2052,14 @@ else {
 # ----- Area: Show form ----------------------
 $mainForm.ResumeLayout(); # Very important to correctly size and position all controls!
 $mainForm.KeyPreview = $True
-$mainForm.Add_KeyUp({if ($_.KeyCode -eq "Escape") {$mainForm.Close()}})
-$mainForm.Add_Shown({ $this.Activate() })
-$mainForm.Add_FormClosing({ $script:BgJobTimer.Stop() })
+$mainForm.Add_KeyUp({
+    if ($_.KeyCode -eq "Escape") {
+        if ($Script:CompListEscapePressed) { $Script:CompListEscapePressed = $false }
+        else { $mainForm.Close() }
+    }
+})
+$mainForm.Add_Shown({ $this.Activate(); Start-ComputerListLoading })
+$mainForm.Add_FormClosing({ $script:BgJobTimer.Stop(); $script:CompListTimer.Stop() })
 Show-Console -Hide;
 [void]$mainForm.ShowDialog()
 
@@ -1856,6 +2069,14 @@ try {
     $psThreadInstance.Dispose()
     $runSpace.Close()
     $runSpace.Dispose()
+}
+catch {}
+try {
+    # A still running LDAP query can't be stopped quickly. In this case the thread ends with the process.
+    if ($ComputerListSyncHash.State -eq 'Running') { throw }
+    $compListPsInstance.Dispose()
+    $compListRunSpace.Close()
+    $compListRunSpace.Dispose()
 }
 catch {}
 $contextMenu.Dispose()
