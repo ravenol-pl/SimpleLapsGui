@@ -1609,11 +1609,11 @@ $mainForm.Icon = $windowIconImage
 # ----- Area: Computer name ----------------------
 $CompHeaderLabel = New-Object system.Windows.Forms.Label
 $CompHeaderLabel.Location = New-Object System.Drawing.Point(10,6)
-$CompHeaderLabel.Size = New-Object System.Drawing.Point(150,25)
+$CompHeaderLabel.Size = New-Object System.Drawing.Point(250,25)
 $CompHeaderLabel.Font = $headerFont
 $CompHeaderLabel.ForeColor = "Black"
 $CompHeaderLabel.BackColor = "White"
-$CompHeaderLabel.Text = "Search Computer"
+$CompHeaderLabel.Text = "Select Computer from List"
 $mainForm.Controls.Add($CompHeaderLabel)
 
 $CompHeaderLine = New-Object system.Windows.Forms.Label
@@ -1627,7 +1627,7 @@ $mainForm.Controls.Add($CompHeaderLine)
 
 $compComboBox = New-Object System.Windows.Forms.ComboBox
 $compComboBox.Location = New-Object System.Drawing.Size(15,36)
-$compComboBox.Size = New-Object System.Drawing.Size(365,50)
+$compComboBox.Size = New-Object System.Drawing.Size(315,50)
 $compComboBox.Font = $textFont
 $compComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
 $compComboBox.Sorted = $false # The list is already sorted.
@@ -1652,9 +1652,9 @@ $mainForm.Controls.Add($compComboBox)
 $Script:CompListEscapePressed = $false
 
 $GoButton = New-Object System.Windows.Forms.Button
-$GoButton.Location = New-Object System.Drawing.Size(400,35)
-$GoButton.Size = New-Object System.Drawing.Size(75,25)
-$GoButton.Text = "Search"
+$GoButton.Location = New-Object System.Drawing.Size(345,35)
+$GoButton.Size = New-Object System.Drawing.Size(130,25)
+$GoButton.Text = "Decrypt Password"
 $GoButton.Font = $textFont
 $GoButton.Add_Click({ Invoke-GetPasswordBtnCmd; })
 $mainForm.Controls.Add($GoButton)
